@@ -95,6 +95,8 @@ cat > "${SSHD_CONF}" <<SSHD_EOF
 
 # ── Port ──────────────────────────────────────────────────────────────────────
 Port ${SSH_PORT}
+AddressFamily                   any
+ListenAddress                   0.0.0.0:$SSH_PORT
 
 # ── Authentication ────────────────────────────────────────────────────────────
 PasswordAuthentication no
