@@ -1,4 +1,4 @@
-# RHEL 10 Security Hardening — Automated Setup Script
+# RHEL 10 Security Hardening -- Automated Setup Script
 
 An automated, defensive shell script designed to streamline security baseline provisioning on **Red Hat Enterprise Linux (RHEL) 10**. 
 
