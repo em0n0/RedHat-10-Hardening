@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# =============================================================================
-#  RHEL 10 Server Hardening Script
+# ===================================================================================
+#  RHEL 10 Server Hardening & Script
 #  Order: Snort Install → OpenSSH → MFA → Firewall → Cowrie → Snort Rules → OpenSCAP
-# =============================================================================
+# This script is intended for an isolated lab / test VM. It opens a honeypot
+# (Cowrie) and changes SSH, firewall and PAM configuration system-wide.
+# Do not run on a production host without reviewing every step first.
+# ===================================================================================
 
 set -euo pipefail
 
@@ -34,7 +37,7 @@ header "PHASE 0 — Configuration Input"
 echo -e "${BOLD}Please provide the following details. Press ENTER to accept defaults.${RESET}\n"
 
 # --- User ID & Name ----------------------------------------------------------
-read -rp "$(echo -e "${CYAN}Enter your User ID:${RESET} ")" USER_ID
+read -rp "$(echo -e "${CYAN}Enter your User (anything) ID:${RESET} ")" USER_ID
 [[ -z "$USER_ID" ]] && err "User ID cannot be empty."
 
 read -rp "$(echo -e "${CYAN}Enter your Full Name:${RESET} ")" USER_NAME
@@ -213,7 +216,7 @@ cat > "$SSHD_CONFIG" <<SSHD_EOF
 # ─── Port & Address ──────────────────────────────────────────────────────────
 Port ${SSH_PORT}
 AddressFamily inet
-ListenAddress 0.0.0.0
+ListenAddress 0.0.0.0:${SSH_PORT}
 
 # ─── Authentication ──────────────────────────────────────────────────────────
 PasswordAuthentication no
@@ -273,7 +276,7 @@ cat > /etc/ssh/sshd_banner <<BANNER_EOF
 #    - There is no expectation of privacy                                      #
 #    - Unauthorized access will be prosecuted to the fullest extent of law     #
 #                                                                              #
-#  User ID         : ${USER_ID}                                                #
+#  User ID : ${USER_ID}                                                        #
 #  Responsible Party   : ${USER_NAME}                                          #
 #                                                                              #
 ################################################################################
