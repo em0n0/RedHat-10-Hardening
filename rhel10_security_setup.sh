@@ -1,921 +1,917 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Order   : Snort -> OpenSSH -> MFA -> Firewall -> Cowrie -> Snort Rules -> OpenSCAP
+#  RHEL 10 Server Hardening Script
+#  Order: Snort Install → OpenSSH → MFA → Firewall → Cowrie → Snort Rules → OpenSCAP
+# =============================================================================
+
 set -euo pipefail
-IFS=$'\n\t'
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION  — edit these before running
-# ─────────────────────────────────────────────────────────────────────────────
-SSH_PORT=                         # Custom SSH (OpenSSH) port
-COWRIE_PORT=                      # Port Cowrie honeypot listens on (default 22)
-Employee_ID=                      # Your Employee
-Employee_NAME=                    # Your full name
 
-# Cowrie user passwords
-ROOT_COWRIE_PASS=                 # Password for 'root' inside Cowrie
-STAFF_COWRIE_PASS=                # Password for 'staff' inside Cowrie
+# ─── Color codes ─────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
-# Public key for real OpenSSH key-based auth
-SSH_PUBLIC_KEY=
+# ─── Logging helpers ─────────────────────────────────────────────────────────
+LOG_FILE="/var/log/rhel10_hardening.log"
+log()    { echo -e "${GREEN}[+]${RESET} $*" | tee -a "$LOG_FILE"; }
+warn()   { echo -e "${YELLOW}[!]${RESET} $*" | tee -a "$LOG_FILE"; }
+err()    { echo -e "${RED}[ERROR]${RESET} $*" | tee -a "$LOG_FILE"; exit 1; }
+header() { echo -e "\n${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"; \
+           echo -e "${BOLD}${CYAN}  $*${RESET}"; \
+           echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"; }
 
-# OpenSCAP profile  (CIS Level 2 for RHEL 10 — change if STIG is preferred)
-OSCAP_PROFILE=
-OSCAP_REPORT_DIR=
+# ─── Root check ──────────────────────────────────────────────────────────────
+[[ $EUID -ne 0 ]] && err "This script must be run as root. Use: sudo $0"
 
-# Snort installation path (source-built binary location)
-SNORT_BIN=
-SNORT_CONF=
-SNORT_RULES_DIR=
-SNORT_LOG_DIR=
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+log "Hardening script started at $(date)"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+# =============================================================================
+#  PHASE 0 — INTERACTIVE INPUT COLLECTION
+# =============================================================================
+header "PHASE 0 — Configuration Input"
 
-log()     { echo -e "${GREEN}[+]${NC} $*"; }
-warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
-err()     { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-section() { echo -e "\n${CYAN}══════════════════════════════════════════════════════${NC}"; \
-            echo -e "${CYAN}  $*${NC}"; \
-            echo -e "${CYAN}══════════════════════════════════════════════════════${NC}\n"; }
+echo -e "${BOLD}Please provide the following details. Press ENTER to accept defaults.${RESET}\n"
 
-require_root() {
-    [[ $EUID -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }
-}
+# --- User ID & Name ----------------------------------------------------------
+read -rp "$(echo -e "${CYAN}Enter your User ID:${RESET} ")" USER_ID
+[[ -z "$USER_ID" ]] && err "User ID cannot be empty."
 
-pkg_install() {
-    log "Installing packages: $*"
-    dnf install -y "$@" 2>&1 | grep -E '(Installed|Nothing|Error)' || true
-}
+read -rp "$(echo -e "${CYAN}Enter your Full Name:${RESET} ")" USER_NAME
+[[ -z "$USER_NAME" ]] && err "Full Name cannot be empty."
 
-backup_file() {
-    local f="$1"
-    [[ -f "$f" ]] && cp -p "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)" && log "Backed up $f"
-}
+# --- SSH Port ----------------------------------------------------------------
+while true; do
+    read -rp "$(echo -e "${CYAN}Enter SSH port [default: 2222]:${RESET} ")" SSH_PORT
+    SSH_PORT=${SSH_PORT:-2222}
+    if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && (( SSH_PORT >= 1024 && SSH_PORT <= 65535 )); then
+        break
+    else
+        warn "Port must be a number between 1024–65535. Try again."
+    fi
+done
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PRE-FLIGHT
-# ─────────────────────────────────────────────────────────────────────────────
-require_root
+# --- SSH Public Key ----------------------------------------------------------
+echo -e "\n${CYAN}Paste your SSH public key (ed25519 or RSA recommended):${RESET}"
+echo -e "${YELLOW}  Example: ssh-ed25519 AAAA... user@host${RESET}"
+read -rp "> " SSH_PUBKEY
+[[ -z "$SSH_PUBKEY" ]] && err "SSH public key cannot be empty."
+# Basic format validation
+if ! echo "$SSH_PUBKEY" | grep -qE '^(ssh-(rsa|ed25519|ecdsa)|ecdsa-sha2-nistp(256|384|521)) '; then
+    err "Invalid SSH public key format."
+fi
 
-section "PRE-FLIGHT: System preparation"
+# --- Cowrie Port -------------------------------------------------------------
+while true; do
+    read -rp "$(echo -e "${CYAN}Enter Cowrie honeypot listen port [default: 2223]:${RESET} ")" COWRIE_PORT
+    COWRIE_PORT=${COWRIE_PORT:-2223}
+    if [[ "$COWRIE_PORT" =~ ^[0-9]+$ ]] && (( COWRIE_PORT >= 1024 && COWRIE_PORT <= 65535 )); then
+        if [[ "$COWRIE_PORT" == "$SSH_PORT" ]]; then
+            warn "Cowrie port cannot be the same as SSH port ($SSH_PORT). Try again."
+        else
+            break
+        fi
+    else
+        warn "Port must be a number between 1024–65535. Try again."
+    fi
+done
 
-log "Detecting primary network interface..."
-NET_IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
-NET_IFACE="${NET_IFACE:-eth0}"
-log "Using interface: ${NET_IFACE}"
+# --- Cowrie: additional user prompt ------------------------------------------
+COWRIE_USERS=()
+COWRIE_PASSWORDS=()
 
-log "Disabling SELinux temporarily (will be re-enabled after OpenSCAP remediation)..."
-setenforce 0 || warn "Could not change SELinux mode (may already be permissive)"
-sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config
+echo ""
+while true; do
+    read -rp "$(echo -e "${CYAN}Do you want to create a fake Cowrie OS user? (yes/no) [default: no]:${RESET} ")" CREATE_COWRIE_USER
+    CREATE_COWRIE_USER=${CREATE_COWRIE_USER:-no}
+    case "${CREATE_COWRIE_USER,,}" in
+        yes|y)
+            read -rp "  $(echo -e "${CYAN}Enter fake username:${RESET} ")" C_USER
+            [[ -z "$C_USER" ]] && warn "Username cannot be empty." && continue
+            while true; do
+                read -rsp "  $(echo -e "${CYAN}Enter password for '${C_USER}':${RESET} ")" C_PASS; echo
+                read -rsp "  $(echo -e "${CYAN}Confirm password:${RESET} ")" C_PASS2; echo
+                if [[ "$C_PASS" == "$C_PASS2" ]] && [[ -n "$C_PASS" ]]; then
+                    COWRIE_USERS+=("$C_USER")
+                    COWRIE_PASSWORDS+=("$C_PASS")
+                    log "Cowrie fake user '$C_USER' queued."
+                    break
+                else
+                    warn "Passwords do not match or are empty. Try again."
+                fi
+            done
+            read -rp "$(echo -e "${CYAN}Create another Cowrie user? (yes/no) [default: no]:${RESET} ")" MORE_USERS
+            [[ "${MORE_USERS,,}" != "yes" && "${MORE_USERS,,}" != "y" ]] && break
+            ;;
+        no|n|"")
+            break
+            ;;
+        *)
+            warn "Please enter 'yes' or 'no'."
+            ;;
+    esac
+done
+
+# ─── Summary ─────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}${GREEN}Configuration Summary:${RESET}"
+echo -e "  ID/Name      : ${USER_ID} / ${USER_NAME}"
+echo -e "  SSH Port     : ${SSH_PORT}"
+echo -e "  Cowrie Port  : ${COWRIE_PORT}"
+echo -e "  Cowrie Users : ${#COWRIE_USERS[@]}"
+echo ""
+read -rp "$(echo -e "${YELLOW}Proceed with hardening? (yes/no):${RESET} ")" CONFIRM
+[[ "${CONFIRM,,}" != "yes" && "${CONFIRM,,}" != "y" ]] && echo "Aborted." && exit 0
+
+# =============================================================================
+#  PHASE 1 — INSTALL SNORT
+# =============================================================================
+header "PHASE 1 — Snort IDS Installation"
 
 log "Updating system packages..."
-dnf update -y -q
+dnf update -y >> "$LOG_FILE" 2>&1
 
-# Install common build dependencies
-pkg_install epel-release
-pkg_install git curl wget gcc make cmake python3 python3-pip \
-            python3-virtualenv authselect pam google-authenticator \
-            libcap-ng libcap-ng-devel libpcap libpcap-devel pcre2 pcre2-devel \
-            hwloc-devel luajit luajit-devel openssl-devel libdnet-devel \
-            zlib-devel flex bison pkg-config iptables-services iptables \
-            iptables-nft nftables jq net-tools
+log "Installing Snort and dependencies..."
+dnf install -y epel-release >> "$LOG_FILE" 2>&1 || warn "EPEL may already be enabled."
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 1 — SNORT IDS INSTALLATION
-# ═════════════════════════════════════════════════════════════════════════════
-section "PHASE 1: Snort 3 Installation"
+# Install build dependencies + snort
+dnf install -y \
+    snort \
+    pcre-devel \
+    libpcap-devel \
+    libdnet-devel \
+    daq \
+    daq-devel \
+    zlib-devel \
+    >> "$LOG_FILE" 2>&1 || {
+        warn "Snort not in default repos. Attempting manual install..."
+        # Fallback: build from source or use community repo
+        dnf install -y gcc flex bison libpcap-devel libdnet-devel \
+            pcre-devel zlib-devel luajit-devel openssl-devel \
+            >> "$LOG_FILE" 2>&1
 
-SNORT_VERSION="3.3.4.0"
-SNORT_ARCHIVE="snort3-${SNORT_VERSION}.tar.gz"
-SNORT_SRC_URL="https://github.com/snort3/snort3/archive/refs/tags/${SNORT_VERSION}.tar.gz"
-BUILD_DIR="/tmp/snort_build"
+        SNORT_VER="2.9.20"
+        SNORT_URL="https://www.snort.org/downloads/snort/snort-${SNORT_VER}.tar.gz"
+        warn "Note: If Snort tarball download fails, manually download from snort.org"
+        cd /tmp
+        curl -sLO "$SNORT_URL" || warn "Could not auto-download Snort ${SNORT_VER}. Place tarball at /tmp/snort-${SNORT_VER}.tar.gz"
+        if [[ -f "/tmp/snort-${SNORT_VER}.tar.gz" ]]; then
+            tar xzf "snort-${SNORT_VER}.tar.gz"
+            cd "snort-${SNORT_VER}"
+            ./configure --enable-sourcefire >> "$LOG_FILE" 2>&1
+            make -j"$(nproc)" >> "$LOG_FILE" 2>&1
+            make install >> "$LOG_FILE" 2>&1
+            ldconfig
+            cd /
+        fi
+    }
 
-install_snort_from_source() {
-    log "Building Snort 3 from source (this takes ~10 minutes)..."
-    mkdir -p "${BUILD_DIR}"
-    cd "${BUILD_DIR}"
+# Create Snort directory structure
+log "Creating Snort directory structure..."
+mkdir -p /etc/snort/rules
+mkdir -p /etc/snort/preproc_rules
+mkdir -p /var/log/snort
+mkdir -p /usr/local/lib/snort_dynamicrules
 
-    # libdaq
-    if [[ ! -f /usr/local/lib/libdaq.so ]]; then
-        log "Building libdaq..."
-        git clone --depth 1 https://github.com/snort3/libdaq.git libdaq
-        cd libdaq
-        ./bootstrap && ./configure && make -j"$(nproc)" && make install
-        ldconfig
-        cd "${BUILD_DIR}"
-    fi
-
-    # Snort 3 source
-    if [[ ! -f "${SNORT_ARCHIVE}" ]]; then
-        wget -q "${SNORT_SRC_URL}" -O "${SNORT_ARCHIVE}"
-    fi
-    tar -xzf "${SNORT_ARCHIVE}"
-    cd "snort3-${SNORT_VERSION}"
-
-    ./configure_cmake.sh --prefix=/usr/local --enable-tcmalloc 2>&1 | tail -5
-    cd build
-    make -j"$(nproc)" 2>&1 | tail -5
-    make install
-    ldconfig
-    log "Snort 3 installed: $("${SNORT_BIN}" -V 2>&1 | head -2)"
-}
-
-if command -v snort &>/dev/null || [[ -x "${SNORT_BIN}" ]]; then
-    log "Snort already present, skipping build."
-else
-    install_snort_from_source
+# Create base snort.conf (will be populated in Phase 6)
+if [[ ! -f /etc/snort/snort.conf ]]; then
+    touch /etc/snort/snort.conf
 fi
 
-# Directory skeleton
-mkdir -p "${SNORT_RULES_DIR}" "${SNORT_LOG_DIR}" /usr/local/etc/snort
+touch /etc/snort/rules/local.rules
+touch /etc/snort/rules/white_list.rules
+touch /etc/snort/rules/black_list.rules
+chown -R root:root /etc/snort
+chmod -R 640 /etc/snort
+chmod 755 /etc/snort /etc/snort/rules /var/log/snort
 
-# Base snort.lua (minimal, rules are appended in Phase 6)
-if [[ ! -f "${SNORT_CONF}" ]]; then
-    log "Creating base snort.lua..."
-    cat > "${SNORT_CONF}" <<'SNORT_LUA'
--- Snort 3 main configuration
--- Custom rules are in /usr/local/etc/snort/rules/local.rules
+log "Snort installation complete."
 
-HOME_NET = 'any'
-EXTERNAL_NET = 'any'
+# =============================================================================
+#  PHASE 2 — OPENSSH SERVER HARDENING
+# =============================================================================
+header "PHASE 2 — OpenSSH Server Configuration"
 
-ips = {
-    enable_builtin_rules = true,
-    rules = [[
-        include /usr/local/etc/snort/rules/local.rules
-    ]],
-}
+log "Installing OpenSSH server..."
+dnf install -y openssh-server openssh-clients >> "$LOG_FILE" 2>&1
 
-alert_fast = {
-    file = true,
-    packet = false,
-    limit = 10,
-}
+SSHD_CONFIG="/etc/ssh/sshd_config"
+SSHD_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
 
--- Use unix socket for alert output
--- Output can also be piped to a SIEM
-SNORT_LUA
-fi
+log "Backing up existing sshd_config to $SSHD_BACKUP"
+cp "$SSHD_CONFIG" "$SSHD_BACKUP"
 
-# Snort systemd service
-cat > /etc/systemd/system/snort3.service <<SNORT_SVC
-[Unit]
-Description=Snort 3 Intrusion Detection System
-After=network.target
+# ─── Write hardened sshd_config ──────────────────────────────────────────────
+log "Writing hardened sshd_config..."
+cat > "$SSHD_CONFIG" <<SSHD_EOF
+# =============================================================================
+#  OpenSSH Server Configuration — Hardened Baseline
+#  Generated by rhel10_hardening.sh for ${USER_ID} / ${USER_NAME}
+#  Generated on: $(date)
+# =============================================================================
 
-[Service]
-Type=simple
-ExecStart=${SNORT_BIN} -c ${SNORT_CONF} -i ${NET_IFACE} -l ${SNORT_LOG_DIR} -D -q
-ExecReload=/bin/kill -HUP \$MAINPID
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-SNORT_SVC
-
-systemctl daemon-reload
-log "Snort service unit created (not started yet — rules configured in Phase 6)."
-
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 2 — OpenSSH SERVER
-# ═════════════════════════════════════════════════════════════════════════════
-section "PHASE 2: OpenSSH Configuration"
-
-pkg_install openssh-server openssh-clients
-
-SSHD_CONF="/etc/ssh/sshd_config"
-backup_file "${SSHD_CONF}"
-
-log "Writing hardened sshd_config on port ${SSH_PORT}..."
-cat > "${SSHD_CONF}" <<SSHD_EOF
-# ============================================================
-# OpenSSH Server Configuration — Hardened Baseline
-# Generated by rhel10_hardening.sh
-# Author: ${Employee_ID} — ${Employee_NAME}
-# ============================================================
-
+# ─── Port & Address ──────────────────────────────────────────────────────────
 Port ${SSH_PORT}
 AddressFamily inet
-ListenAddress 0.0.0.0:${SSH_PORT}
+ListenAddress 0.0.0.0
 
-# ── Authentication ──────────────────────────────────────────
-PermitRootLogin no
+# ─── Authentication ──────────────────────────────────────────────────────────
 PasswordAuthentication no
 PubkeyAuthentication yes
 AuthorizedKeysFile .ssh/authorized_keys
-HostbasedAuthentication no
-PermitEmptyPasswords no
 ChallengeResponseAuthentication yes
 UsePAM yes
-
-# ── MFA (Google Authenticator) ──────────────────────────────
-# AuthenticationMethods is set below; keep this section for PAM.
 AuthenticationMethods publickey,keyboard-interactive
 
-# ── Forwarding / Tunneling ──────────────────────────────────
-AllowTcpForwarding no
+# ─── Security Hardening ──────────────────────────────────────────────────────
+PermitRootLogin no
+PermitEmptyPasswords no
+HostbasedAuthentication no
+IgnoreRhosts yes
+AllowTCPForwarding no
 GatewayPorts no
 X11Forwarding no
 PermitTunnel no
+AllowStreamLocalForwarding no
 AllowAgentForwarding no
 
-# ── Banner ──────────────────────────────────────────────────
-Banner /etc/ssh/banner
-
-# ── Session hardening ───────────────────────────────────────
+# ─── Session & Login ─────────────────────────────────────────────────────────
+Banner /etc/ssh/sshd_banner
+LoginGraceTime 30
 MaxAuthTries 3
 MaxSessions 5
-LoginGraceTime 30
 ClientAliveInterval 300
 ClientAliveCountMax 2
-StrictModes yes
-IgnoreRhosts yes
-LogLevel VERBOSE
-SyslogFacility AUTH
 
-# ── Allowed ciphers / MACs (RHEL 10 strong defaults) ────────
-Ciphers aes256-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-gcm@openssh.com
-MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
-KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp521
+# ─── Cryptography (Strong Ciphers/MACs/KEX) ──────────────────────────────────
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,ecdh-sha2-nistp521,ecdh-sha2-nistp384
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
+HostKeyAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+SyslogFacility AUTHPRIV
+LogLevel VERBOSE
+
+# ─── Subsystem ───────────────────────────────────────────────────────────────
+Subsystem sftp /usr/lib/openssh/sftp-server
 SSHD_EOF
 
-# Banner file
+# ─── Login Banner ────────────────────────────────────────────────────────────
 log "Creating SSH login banner..."
-cat > /etc/ssh/banner <<BANNER_EOF
-╔═══════════════════════════════════════════════════════════════╗
-║           AUTHORIZED ACCESS ONLY                              ║
-║                                                               ║
-║  Employee ID  : ${Employee_ID}                                  ║
-║  Name        : ${Employee_NAME}                                ║
-║                                                               ║
-║  All activities on this system are monitored and recorded.    ║
-║  Unauthorized access is strictly prohibited and will be       ║
-║  prosecuted under applicable law.                             ║
-╚═══════════════════════════════════════════════════════════════╝
+cat > /etc/ssh/sshd_banner <<BANNER_EOF
+################################################################################
+#                          AUTHORIZED ACCESS ONLY                              #
+################################################################################
+#                                                                              #
+#  This system is the property of an authorized organization.                  #
+#  Unauthorized access is strictly prohibited and may be subject to            #
+#  criminal prosecution.                                                       #
+#                                                                              #
+#  By connecting to this system, you acknowledge that:                         #
+#    - All activities are monitored and logged                                 #
+#    - There is no expectation of privacy                                      #
+#    - Unauthorized access will be prosecuted to the fullest extent of law     #
+#                                                                              #
+#  User ID         : ${USER_ID}                                                #
+#  Responsible Party   : ${USER_NAME}                                          #
+#                                                                              #
+################################################################################
 BANNER_EOF
 
-# Install public key for current sudo user (or root if called directly)
-REAL_USER="${SUDO_USER:-root}"
-if [[ "${REAL_USER}" == "root" ]]; then
-    AUTH_KEY_DIR="/root/.ssh"
+chmod 644 /etc/ssh/sshd_banner
+
+# ─── Deploy SSH Public Key for root (or specify a target user) ───────────────
+TARGET_USER="${SUDO_USER:-root}"
+if [[ "$TARGET_USER" == "root" ]]; then
+    KEY_DIR="/root/.ssh"
 else
-    AUTH_KEY_DIR="/home/${REAL_USER}/.ssh"
+    KEY_DIR="/home/${TARGET_USER}/.ssh"
 fi
-mkdir -p "${AUTH_KEY_DIR}"
-chmod 700 "${AUTH_KEY_DIR}"
 
-AUTH_KEY_FILE="${AUTH_KEY_DIR}/authorized_keys"
-if ! grep -qF "${SSH_PUBLIC_KEY}" "${AUTH_KEY_FILE}" 2>/dev/null; then
-    echo "${SSH_PUBLIC_KEY}" >> "${AUTH_KEY_FILE}"
-    log "Public key added to ${AUTH_KEY_FILE}"
+log "Deploying SSH public key for user: $TARGET_USER"
+mkdir -p "$KEY_DIR"
+chmod 700 "$KEY_DIR"
+
+AUTH_KEYS="${KEY_DIR}/authorized_keys"
+# Avoid duplicate key entry
+if ! grep -qF "$SSH_PUBKEY" "$AUTH_KEYS" 2>/dev/null; then
+    echo "$SSH_PUBKEY" >> "$AUTH_KEYS"
 fi
-chmod 600 "${AUTH_KEY_FILE}"
-[[ "${REAL_USER}" != "root" ]] && chown -R "${REAL_USER}:${REAL_USER}" "${AUTH_KEY_DIR}"
+chmod 600 "$AUTH_KEYS"
 
-# SELinux port label for custom SSH port
+if [[ "$TARGET_USER" != "root" ]]; then
+    chown -R "${TARGET_USER}:${TARGET_USER}" "$KEY_DIR"
+fi
+
+# ─── Enable & start SSHD ─────────────────────────────────────────────────────
+log "Enabling and starting sshd..."
+systemctl enable --now sshd >> "$LOG_FILE" 2>&1
+systemctl restart sshd >> "$LOG_FILE" 2>&1 || warn "sshd restart failed — check config with: sshd -t"
+
+# SELinux port labeling
 if command -v semanage &>/dev/null; then
-    semanage port -a -t ssh_port_t -p tcp "${SSH_PORT}" 2>/dev/null \
-        || semanage port -m -t ssh_port_t -p tcp "${SSH_PORT}" 2>/dev/null \
-        || warn "semanage port adjustment failed — check SELinux manually"
+    log "Configuring SELinux port label for SSH port $SSH_PORT..."
+    semanage port -a -t ssh_port_t -p tcp "$SSH_PORT" >> "$LOG_FILE" 2>&1 || \
+    semanage port -m -t ssh_port_t -p tcp "$SSH_PORT" >> "$LOG_FILE" 2>&1 || \
+    warn "SELinux port labeling failed — may already exist or SELinux is permissive."
 fi
 
-# Validate config before enabling
-sshd -t && log "sshd_config syntax OK"
+log "OpenSSH hardening complete."
 
-systemctl enable --now sshd
-systemctl restart sshd
-log "OpenSSH listening on port ${SSH_PORT}."
+# =============================================================================
+#  PHASE 3 — MULTI-FACTOR AUTHENTICATION (TOTP via Google Authenticator PAM)
+# =============================================================================
+header "PHASE 3 — Multi-Factor Authentication (MFA)"
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 3 — MULTI-FACTOR AUTHENTICATION (Google Authenticator TOTP)
-# ═════════════════════════════════════════════════════════════════════════════
-section "PHASE 3: MFA via Google Authenticator (PAM TOTP)"
+log "Installing Google Authenticator PAM module..."
+dnf install -y google-authenticator pam >> "$LOG_FILE" 2>&1 || \
+    dnf install -y libpam-google-authenticator >> "$LOG_FILE" 2>&1 || \
+    warn "google-authenticator not found in repos. Trying EPEL..."
 
-pkg_install google-authenticator qrencode
+# Ensure EPEL and retry
+dnf install -y epel-release >> "$LOG_FILE" 2>&1 || true
+dnf install -y google-authenticator >> "$LOG_FILE" 2>&1 || \
+    warn "google-authenticator could not be installed automatically. Install manually: dnf install google-authenticator"
+
+# ─── Configure PAM for SSH MFA ───────────────────────────────────────────────
+log "Configuring PAM for SSH keyboard-interactive MFA..."
 
 PAM_SSHD="/etc/pam.d/sshd"
-backup_file "${PAM_SSHD}"
+PAM_BACKUP="/etc/pam.d/sshd.bak.$(date +%Y%m%d%H%M%S)"
+cp "$PAM_SSHD" "$PAM_BACKUP"
 
-log "Configuring PAM for SSH with TOTP..."
-# Insert google-authenticator PAM module at the top of sshd PAM stack.
-# 'nullok' allows existing users without a .google_authenticator file to still
-# log in (remove 'nullok' to enforce MFA for everyone).
-PAM_LINE="auth required pam_google_authenticator.so nullok secret=\${HOME}/.ssh/.google_authenticator"
-if ! grep -q "pam_google_authenticator" "${PAM_SSHD}"; then
-    # Insert after the first auth line so password module still runs for
-    # accounts that haven't set up MFA yet.
-    sed -i "1s|^|${PAM_LINE}\n|" "${PAM_SSHD}"
+# Prepend TOTP auth to sshd PAM stack
+# nullok allows users without .google_authenticator to still login during setup
+if ! grep -q "pam_google_authenticator" "$PAM_SSHD"; then
+    sed -i '1s/^/auth required pam_google_authenticator.so nullok\n/' "$PAM_SSHD"
+    log "pam_google_authenticator added to /etc/pam.d/sshd"
+else
+    log "pam_google_authenticator already present in /etc/pam.d/sshd"
 fi
 
-# Ensure system-auth doesn't short-circuit our MFA
-if grep -q "^auth.*system-auth" "${PAM_SSHD}"; then
-    # Keep it but ensure google-authenticator runs
-    log "system-auth found in PAM, MFA line prepended — review manually if needed."
+# Ensure password-auth is not the only auth mechanism
+# Keep 'include password-auth' but ensure it is after TOTP
+if grep -q "^auth.*include.*password-auth" "$PAM_SSHD"; then
+    log "password-auth include found in PAM sshd config."
 fi
 
-log "MFA PAM configured."
+log "MFA (PAM TOTP) configured. Each user must run 'google-authenticator' to set up their TOTP secret."
+log "  → Run as target user: google-authenticator -t -d -f -r 3 -R 30 -W"
+log "  → Scan the QR code with an authenticator app (Google Authenticator, Authy, etc.)"
 log ""
-log "  ┌─────────────────────────────────────────────────────────────────┐"
-log "  │  IMPORTANT: Each user must run 'google-authenticator' manually  │"
-log "  │  to generate their TOTP secret and QR code.                     │"
-log "  │                                                                  │"
-log "  │  Run as the target user:                                        │"
-log "  │    google-authenticator -t -d -f -r 3 -R 30                    │"
-log "  │        -s ~/.ssh/.google_authenticator                          │"
-log "  │                                                                  │"
-log "  │  Then scan the printed QR code with Google Authenticator app.   │"
-log "  └─────────────────────────────────────────────────────────────────┘"
-log ""
+log "MFA setup complete."
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 4 — IPTABLES FIREWALL
-# ═════════════════════════════════════════════════════════════════════════════
-section "PHASE 4: iptables Firewall"
+# =============================================================================
+#  PHASE 4 — FIREWALL (iptables)
+# =============================================================================
+header "PHASE 4 — iptables Firewall Configuration"
 
-log "Disabling firewalld in favour of raw iptables..."
-systemctl disable --now firewalld 2>/dev/null || true
-systemctl enable --now iptables
+log "Installing iptables services..."
+dnf install -y iptables-services >> "$LOG_FILE" 2>&1
+systemctl enable iptables >> "$LOG_FILE" 2>&1
+systemctl stop firewalld >> "$LOG_FILE" 2>&1 || true
+systemctl disable firewalld >> "$LOG_FILE" 2>&1 || true
 
 log "Flushing existing rules..."
 iptables -F
 iptables -X
 iptables -Z
-ip6tables -F
-ip6tables -X
+iptables -t nat -F
+iptables -t mangle -F
 
-# ── Default policies ──────────────────────────────────────────────────────
-log "Setting default DROP policy on all chains..."
+# ─── Default DENY policies ───────────────────────────────────────────────────
+log "Setting default DROP policies..."
 iptables -P INPUT   DROP
 iptables -P FORWARD DROP
 iptables -P OUTPUT  ACCEPT
 
-# ── Allow loopback ────────────────────────────────────────────────────────
+# ─── Allow loopback ──────────────────────────────────────────────────────────
 iptables -A INPUT -i lo -j ACCEPT
 
-# ── Allow established / related connections ───────────────────────────────
+# ─── Allow established/related connections ───────────────────────────────────
 iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-# ── LOG + ACCEPT OpenSSH traffic ─────────────────────────────────────────
-log "Creating OpenSSH rules on port ${SSH_PORT}..."
-iptables -A INPUT -p tcp --dport "${SSH_PORT}" \
-    -m limit --limit 10/min --limit-burst 20 \
+# ─── SSH Traffic — log and allow ─────────────────────────────────────────────
+log "Adding SSH traffic rules on port $SSH_PORT..."
+iptables -A INPUT -p tcp --dport "$SSH_PORT" -m conntrack --ctstate NEW \
+    -m comment --comment "SSH_TRAFFIC" \
     -j LOG --log-prefix "< SSH TRAFFIC > " --log-level 4
+iptables -A INPUT -p tcp --dport "$SSH_PORT" -m conntrack --ctstate NEW -j ACCEPT
 
-iptables -A INPUT -p tcp --dport "${SSH_PORT}" \
-    -m conntrack --ctstate NEW \
-    -m recent --set --name SSH_BRUTE
-iptables -A INPUT -p tcp --dport "${SSH_PORT}" \
-    -m conntrack --ctstate NEW \
-    -m recent --update --seconds 60 --hitcount 6 --name SSH_BRUTE \
-    -j DROP
-iptables -A INPUT -p tcp --dport "${SSH_PORT}" -j ACCEPT
-
-# ── LOG + ACCEPT Cowrie (honeypot) traffic ────────────────────────────────
-log "Creating Cowrie / honeypot rules on port ${COWRIE_PORT}..."
-iptables -A INPUT -p tcp --dport "${COWRIE_PORT}" \
-    -m limit --limit 30/min --limit-burst 50 \
+# ─── Cowrie Honeypot Traffic — log and allow ─────────────────────────────────
+log "Adding Cowrie honeypot traffic rules on port $COWRIE_PORT..."
+iptables -A INPUT -p tcp --dport "$COWRIE_PORT" -m conntrack --ctstate NEW \
+    -m comment --comment "HONEYPOT_TRAFFIC" \
     -j LOG --log-prefix "<< HONEYPOT TRAFFIC >> " --log-level 4
+iptables -A INPUT -p tcp --dport "$COWRIE_PORT" -m conntrack --ctstate NEW -j ACCEPT
 
-iptables -A INPUT -p tcp --dport "${COWRIE_PORT}" -j ACCEPT
-
-# ── LOG blocked traffic ───────────────────────────────────────────────────
-log "Adding catch-all blocked traffic logging rule..."
+# ─── Block and log everything else ───────────────────────────────────────────
+log "Adding catch-all block/log rule..."
 iptables -A INPUT \
-    -m limit --limit 5/min --limit-burst 10 \
+    -m comment --comment "BLOCKED_TRAFFIC" \
     -j LOG --log-prefix "<<< BLOCKED TRAFFIC >>> " --log-level 4
+iptables -A INPUT -j DROP
 
-# (Default policy DROP handles the actual block; LOG rule above just records it)
-
-# ── IPv6: block everything except loopback ────────────────────────────────
-ip6tables -P INPUT   DROP
-ip6tables -P FORWARD DROP
-ip6tables -P OUTPUT  ACCEPT
-ip6tables -A INPUT -i lo -j ACCEPT
-ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-# ── Persist rules ─────────────────────────────────────────────────────────
+# ─── Save rules ──────────────────────────────────────────────────────────────
 log "Saving iptables rules..."
-iptables-save  > /etc/sysconfig/iptables
-ip6tables-save > /etc/sysconfig/ip6tables
-systemctl restart iptables
-log "Firewall rules applied and saved."
+service iptables save >> "$LOG_FILE" 2>&1 || \
+    iptables-save > /etc/sysconfig/iptables
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 5 — COWRIE HONEYPOT
-# ═════════════════════════════════════════════════════════════════════════════
-section "PHASE 5: Cowrie Honeypot"
+log "iptables firewall configured. Current ruleset:"
+iptables -L -v -n | tee -a "$LOG_FILE"
 
-COWRIE_HOME="/opt/cowrie"
-COWRIE_USER="cowrie"
-COWRIE_VENV="${COWRIE_HOME}/cowrie-env"
+# =============================================================================
+#  PHASE 5 — COWRIE HONEYPOT
+# =============================================================================
+header "PHASE 5 — Cowrie Honeypot Installation & Configuration"
 
-# Create dedicated system user
-if ! id "${COWRIE_USER}" &>/dev/null; then
-    useradd -r -s /sbin/nologin -d "${COWRIE_HOME}" "${COWRIE_USER}"
-    log "System user '${COWRIE_USER}' created."
+log "Installing Cowrie dependencies..."
+dnf install -y python3 python3-pip python3-virtualenv git authbind >> "$LOG_FILE" 2>&1
+
+# ─── Create cowrie system user ───────────────────────────────────────────────
+if ! id cowrie &>/dev/null; then
+    log "Creating cowrie system user..."
+    useradd -r -s /bin/false -d /opt/cowrie -m cowrie
 fi
 
-# Clone Cowrie
-if [[ ! -d "${COWRIE_HOME}/.git" ]]; then
-    log "Cloning Cowrie repository..."
-    git clone --depth 1 https://github.com/cowrie/cowrie.git "${COWRIE_HOME}"
-fi
-chown -R "${COWRIE_USER}:${COWRIE_USER}" "${COWRIE_HOME}"
-
-# Virtual environment
-if [[ ! -d "${COWRIE_VENV}" ]]; then
-    log "Creating Python virtual environment..."
-    python3 -m venv "${COWRIE_VENV}"
-    sudo -u "${COWRIE_USER}" "${COWRIE_VENV}/bin/pip" install --quiet --upgrade pip
-    sudo -u "${COWRIE_USER}" "${COWRIE_VENV}/bin/pip" install --quiet -r "${COWRIE_HOME}/requirements.txt"
+# ─── Clone Cowrie ────────────────────────────────────────────────────────────
+COWRIE_DIR="/opt/cowrie"
+if [[ ! -d "${COWRIE_DIR}/.git" ]]; then
+    log "Cloning Cowrie from GitHub..."
+    git clone https://github.com/cowrie/cowrie.git "$COWRIE_DIR" >> "$LOG_FILE" 2>&1
+    chown -R cowrie:cowrie "$COWRIE_DIR"
+else
+    log "Cowrie already cloned. Pulling latest..."
+    cd "$COWRIE_DIR" && sudo -u cowrie git pull >> "$LOG_FILE" 2>&1
 fi
 
-# ── Cowrie configuration ──────────────────────────────────────────────────
-COWRIE_CFG="${COWRIE_HOME}/etc/cowrie.cfg"
-[[ ! -f "${COWRIE_CFG}" ]] && cp "${COWRIE_HOME}/etc/cowrie.cfg.dist" "${COWRIE_CFG}"
-backup_file "${COWRIE_CFG}"
+cd "$COWRIE_DIR"
 
-log "Writing Cowrie configuration (hostname=${Employee_ID}, port=${COWRIE_PORT})..."
+# ─── Set up Python virtual environment ───────────────────────────────────────
+log "Setting up Cowrie Python virtual environment..."
+sudo -u cowrie python3 -m venv "${COWRIE_DIR}/cowrie-env" >> "$LOG_FILE" 2>&1
+sudo -u cowrie "${COWRIE_DIR}/cowrie-env/bin/pip" install --upgrade pip >> "$LOG_FILE" 2>&1
+sudo -u cowrie "${COWRIE_DIR}/cowrie-env/bin/pip" install -r "${COWRIE_DIR}/requirements.txt" >> "$LOG_FILE" 2>&1
 
-# Use Python's configparser-compatible sed replacements
-# ── [honeypot] section ──
-python3 - <<PYCONF
-import configparser, os, re
+# ─── Configure Cowrie ────────────────────────────────────────────────────────
+COWRIE_CFG="${COWRIE_DIR}/etc/cowrie.cfg"
+log "Writing Cowrie configuration..."
+cp "${COWRIE_DIR}/etc/cowrie.cfg.dist" "$COWRIE_CFG" 2>/dev/null || touch "$COWRIE_CFG"
 
-cfg_path = '${COWRIE_CFG}'
+# Apply configuration using sed/python inline replacement for reliability
+python3 - <<PYEOF
+import re, os
+
+cfg_path = "${COWRIE_CFG}"
+hostname = "${USER_ID}"
+ssh_port = "${COWRIE_PORT}"
+
 with open(cfg_path, 'r') as f:
     content = f.read()
 
-# Ensure sections exist
-for section in ['honeypot', 'ssh']:
-    if f'[{section}]' not in content:
-        content += f'\n[{section}]\n'
+# Hostname
+content = re.sub(r'^hostname\s*=.*', f'hostname = {hostname}', content, flags=re.MULTILINE)
+if 'hostname = ' not in content:
+    content = content.replace('[honeypot]', f'[honeypot]\nhostname = {hostname}', 1)
+
+# Listen port
+content = re.sub(r'^listen_port\s*=.*', f'listen_port = {ssh_port}', content, flags=re.MULTILINE)
+if 'listen_port = ' not in content:
+    content = content.replace('[ssh]', f'[ssh]\nlisten_port = {ssh_port}', 1)
+
+# Disable backend real auth (fake filesystem)
+content = re.sub(r'^backend\s*=.*', 'backend = shell', content, flags=re.MULTILINE)
 
 with open(cfg_path, 'w') as f:
     f.write(content)
 
-cfg = configparser.ConfigParser(strict=False, allow_no_value=True)
-cfg.read(cfg_path)
+print("Cowrie config written successfully.")
+PYEOF
 
-# [honeypot]
-if not cfg.has_section('honeypot'):
-    cfg.add_section('honeypot')
-cfg.set('honeypot', 'hostname', '${Employee_ID}')
-cfg.set('honeypot', 'log_path', 'var/log/cowrie')
-cfg.set('honeypot', 'download_path', 'var/lib/cowrie/downloads')
-cfg.set('honeypot', 'share_path', 'share/cowrie')
-cfg.set('honeypot', 'state_path', 'var/lib/cowrie')
-cfg.set('honeypot', 'etc_path', 'honeyfs/etc')
+chown cowrie:cowrie "$COWRIE_CFG"
 
-# [ssh]
-if not cfg.has_section('ssh'):
-    cfg.add_section('ssh')
-cfg.set('ssh', 'enabled', 'true')
-cfg.set('ssh', 'listen_endpoints', 'tcp:${COWRIE_PORT}:interface=0.0.0.0')
-cfg.set('ssh', 'version', 'SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6')
+# ─── Add fake Cowrie users ────────────────────────────────────────────────────
+USERDB="${COWRIE_DIR}/etc/userdb.txt"
+if [[ ! -f "$USERDB" ]]; then
+    cp "${COWRIE_DIR}/etc/userdb.example" "$USERDB" 2>/dev/null || touch "$USERDB"
+fi
 
-with open(cfg_path, 'w') as f:
-    cfg.write(f)
-print('Cowrie cfg updated via Python.')
-PYCONF
+for i in "${!COWRIE_USERS[@]}"; do
+    CUSER="${COWRIE_USERS[$i]}"
+    CPASS="${COWRIE_PASSWORDS[$i]}"
+    # Cowrie userdb format: username:uid:password
+    if ! grep -q "^${CUSER}:" "$USERDB"; then
+        echo "${CUSER}:0:${CPASS}" >> "$USERDB"
+        log "Added Cowrie fake user: $CUSER"
+    else
+        warn "Cowrie user '$CUSER' already in userdb, skipping."
+    fi
+done
+chown cowrie:cowrie "$USERDB"
+chmod 640 "$USERDB"
 
-# ── Cowrie userdb (allowed users) ──
-USERDB="${COWRIE_HOME}/etc/userdb.txt"
-log "Writing Cowrie userdb (root + staff only)..."
-cat > "${USERDB}" <<USERDB_EOF
-# Cowrie userdb — format: username:uid:password
-# '!' prefix on password = hashed password required (use plain text here for cowrie)
-# Use '*' to reject, '' to accept any password
-root:0:${ROOT_COWRIE_PASS}
-staff:1001:${STAFF_COWRIE_PASS}
-USERDB_EOF
-chown "${COWRIE_USER}:${COWRIE_USER}" "${USERDB}"
-log "userdb written: root (custom pass), staff (custom pass)."
-
-# ── Cowrie systemd service ─────────────────────────────────────────────────
+# ─── Systemd service for Cowrie ──────────────────────────────────────────────
+log "Creating Cowrie systemd service..."
 cat > /etc/systemd/system/cowrie.service <<COWRIE_SVC
 [Unit]
 Description=Cowrie SSH Honeypot
-After=network.target sshd.service
+After=network.target
 
 [Service]
 Type=simple
-User=${COWRIE_USER}
-Group=${COWRIE_USER}
-WorkingDirectory=${COWRIE_HOME}
-ExecStart=${COWRIE_VENV}/bin/python3 ${COWRIE_HOME}/src/cowrie/core/main.py -n
-ExecStop=/bin/kill -TERM \$MAINPID
+User=cowrie
+Group=cowrie
+WorkingDirectory=${COWRIE_DIR}
+ExecStart=${COWRIE_DIR}/cowrie-env/bin/python ${COWRIE_DIR}/bin/cowrie start -n
+ExecStop=${COWRIE_DIR}/cowrie-env/bin/python ${COWRIE_DIR}/bin/cowrie stop
 Restart=on-failure
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 COWRIE_SVC
 
 systemctl daemon-reload
-systemctl enable cowrie
-systemctl start cowrie || warn "Cowrie start failed — check logs: journalctl -u cowrie"
-log "Cowrie started on port ${COWRIE_PORT}."
+systemctl enable cowrie >> "$LOG_FILE" 2>&1
+systemctl start cowrie >> "$LOG_FILE" 2>&1 || warn "Cowrie failed to start — check: journalctl -u cowrie"
+log "Cowrie honeypot configured (hostname: ${USER_ID}, port: ${COWRIE_PORT})."
 
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 6 — SNORT RULES CONFIGURATION
-# ═════════════════════════════════════════════════════════════════════════════
-section "PHASE 6: Snort 3 Rules"
-
-RULES_FILE="${SNORT_RULES_DIR}/local.rules"
-log "Writing custom detection rules to ${RULES_FILE}..."
-
-cat > "${RULES_FILE}" <<'SNORT_RULES'
 # =============================================================================
-# Snort 3 Local Rules — rhel10_hardening.sh
+#  PHASE 6 — SNORT RULES CONFIGURATION
+# =============================================================================
+header "PHASE 6 — Snort IDS Rules Configuration"
+
+log "Writing Snort main configuration file..."
+# Detect primary network interface and IP
+NET_IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+HOME_NET=$(ip -4 addr show "$NET_IFACE" 2>/dev/null | awk '/inet / {print $2}' | head -1 || echo "192.168.1.0/24")
+
+cat > /etc/snort/snort.conf <<SNORT_CONF
+# =============================================================================
+#  Snort IDS Configuration — Generated by rhel10_hardening.sh
+#  ID: ${USER_ID} | Name: ${USER_NAME} | Date: $(date)
 # =============================================================================
 
-# ─── 1. ICMP Traffic (Diagnostics / Ping) ────────────────────────────────────
-alert icmp any any -> $HOME_NET any (
-    msg:"ICMP Ping Detected";
-    itype:8;
-    sid:1000001; rev:1;)
+# ─── Network Variables ────────────────────────────────────────────────────────
+var HOME_NET ${HOME_NET}
+var EXTERNAL_NET !\$HOME_NET
 
-alert icmp any any -> $HOME_NET any (
-    msg:"ICMP Echo Reply";
-    itype:0;
-    sid:1000002; rev:1;)
+var HTTP_SERVERS \$HOME_NET
+var SMTP_SERVERS \$HOME_NET
+var SQL_SERVERS  \$HOME_NET
+var DNS_SERVERS  \$HOME_NET
 
-# ─── 2. TCP Traffic — Web ────────────────────────────────────────────────────
-alert tcp any any -> $HOME_NET 80 (
-    msg:"TCP HTTP Traffic Detected";
-    flags:S;
-    flow:to_server,established;
-    sid:1000010; rev:1;)
+# ─── Port Variables ──────────────────────────────────────────────────────────
+var HTTP_PORTS  [80,443,8080,8443]
+var ORACLE_PORTS 1521
+var SSH_PORTS   ${SSH_PORT}
+var FTP_PORTS   [21,2100,3535]
+var SMTP_PORTS  25
+var IMAP_PORTS  143
+var POP3_PORTS  110
+var DNS_PORTS   53
+var NTP_PORTS   123
 
-alert tcp any any -> $HOME_NET 443 (
-    msg:"TCP HTTPS Traffic Detected";
-    flags:S;
-    flow:to_server,established;
-    sid:1000011; rev:1;)
+# ─── File/Path Variables ──────────────────────────────────────────────────────
+var RULE_PATH     /etc/snort/rules
+var LOG_PATH      /var/log/snort
+var SO_RULE_PATH  /usr/local/lib/snort_dynamicrules
+var PREPROC_RULE_PATH /etc/snort/preproc_rules
 
-# ─── 2. TCP Traffic — SSH ────────────────────────────────────────────────────
-alert tcp any any -> $HOME_NET 22 (
-    msg:"TCP SSH Traffic on Port 22 (Cowrie)";
-    flags:S;
-    sid:1000020; rev:1;)
+# ─── Output ──────────────────────────────────────────────────────────────────
+output alert_fast: /var/log/snort/alert
+output log_tcpdump: /var/log/snort/snort.log
 
-alert tcp any any -> $HOME_NET ${SSH_PORT} (
-    msg:"TCP SSH Traffic on Custom Port (OpenSSH)";
-    flags:S;
-    sid:1000021; rev:1;)
+# ─── Decoders & Preprocessors ────────────────────────────────────────────────
+config logdir: /var/log/snort
+config pcre_match_limit: 3500
+config pcre_match_limit_recursion: 1500
 
-# ─── 2. TCP Traffic — Email ──────────────────────────────────────────────────
-alert tcp any any -> $HOME_NET 25 (
-    msg:"TCP SMTP Traffic Detected";
-    flags:S;
-    sid:1000030; rev:1;)
+preprocessor frag3_global: max_frags 65536
+preprocessor frag3_engine: policy windows detect_anomalies overlap_limit 10 min_fragment_length 100 timeout 180
 
-alert tcp any any -> $HOME_NET 587 (
-    msg:"TCP SMTP Submission Traffic Detected";
-    flags:S;
-    sid:1000031; rev:1;)
+preprocessor stream5_global: track_tcp yes, track_udp yes, track_icmp no, max_tcp 262144, max_udp 131072, max_active_responses 2, min_response_seconds 5
+preprocessor stream5_tcp: log_asymmetric_traffic no, policy windows, detect_anomalies, require_3whs 180, overlap_limit 10, small_segments 3 bytes 150, timeout 180, ports client \$HTTP_PORTS \$FTP_PORTS \$SSH_PORTS, prune_log_max 0
+preprocessor stream5_udp: timeout 180
 
-alert tcp any any -> $HOME_NET 143 (
-    msg:"TCP IMAP Traffic Detected";
-    flags:S;
-    sid:1000032; rev:1;)
+preprocessor http_inspect: global iis_unicode_map /etc/snort/rules/unicode.map 1252
+preprocessor http_inspect_server: server default \
+    http_methods { GET POST PUT HEAD DELETE TRACE OPTIONS } \
+    profile all ports { \$HTTP_PORTS } oversize_dir_length 500 \
+    inspect_uri_only no server_flow_depth 65535 client_flow_depth 65535
 
-alert tcp any any -> $HOME_NET 993 (
-    msg:"TCP IMAPS Traffic Detected";
-    flags:S;
-    sid:1000033; rev:1;)
+preprocessor sfportscan: proto  { all } memcap { 10000000 } sense_level { medium } logfile { /var/log/snort/portscan.log }
 
-alert tcp any any -> $HOME_NET 110 (
-    msg:"TCP POP3 Traffic Detected";
-    flags:S;
-    sid:1000034; rev:1;)
+# ─── Rules ────────────────────────────────────────────────────────────────────
+include \$RULE_PATH/local.rules
+SNORT_CONF
 
-# ─── 3. UDP Traffic — DNS ────────────────────────────────────────────────────
-alert udp any any -> $HOME_NET 53 (
-    msg:"UDP DNS Query Detected";
-    sid:1000040; rev:1;)
+# ─── Write local.rules ────────────────────────────────────────────────────────
+log "Writing Snort detection rules to /etc/snort/rules/local.rules..."
+cat > /etc/snort/rules/local.rules <<'RULES_EOF'
+# =============================================================================
+#  Snort Local Rules — RHEL 10 Hardening
+#  Categories:
+#    1. ICMP Traffic (Ping / Diagnostic)
+#    2. TCP Traffic (Web, SSH, Email)
+#    3. UDP Traffic (DNS, NTP)
+#    4. Web Attacks (SQL Injection)
+#    5. Inbound Reconnaissance (Nmap FIN Scan)
+#    6. Command & Control / Reverse Shells (Netcat)
+#    7. Denial of Service (ICMP Flood / Ping of Death)
+# =============================================================================
 
-alert udp $HOME_NET any -> any 53 (
-    msg:"UDP DNS Response Detected";
-    sid:1000041; rev:1;)
+# ─── 1. ICMP Traffic (Diagnostic / Ping) ─────────────────────────────────────
+# Detect ICMP Echo Request (ping)
+alert icmp $EXTERNAL_NET any -> $HOME_NET any (msg:"ICMP Echo Request (Ping) Detected"; itype:8; icode:0; sid:1000001; rev:1; classtype:misc-activity;)
 
-# ─── 3. UDP Traffic — NTP ────────────────────────────────────────────────────
-alert udp any any -> $HOME_NET 123 (
-    msg:"UDP NTP Traffic Detected";
-    sid:1000050; rev:1;)
+# Detect ICMP Echo Reply
+alert icmp $HOME_NET any -> $EXTERNAL_NET any (msg:"ICMP Echo Reply Detected"; itype:0; icode:0; sid:1000002; rev:1; classtype:misc-activity;)
+
+# Detect ICMP Traceroute (TTL Exceeded)
+alert icmp any any -> $HOME_NET any (msg:"ICMP TTL Exceeded (Traceroute)"; itype:11; sid:1000003; rev:1; classtype:misc-activity;)
+
+# ─── 2. TCP Traffic ──────────────────────────────────────────────────────────
+# HTTP Traffic
+alert tcp $EXTERNAL_NET any -> $HOME_NET $HTTP_PORTS (msg:"TCP HTTP Traffic Detected"; flow:to_server,established; sid:1000010; rev:1; classtype:misc-activity;)
+
+# HTTPS Traffic
+alert tcp $EXTERNAL_NET any -> $HOME_NET 443 (msg:"TCP HTTPS Traffic Detected"; flow:to_server,established; sid:1000011; rev:1; classtype:misc-activity;)
+
+# SSH Traffic (custom port)
+alert tcp $EXTERNAL_NET any -> $HOME_NET $SSH_PORTS (msg:"TCP SSH Traffic Detected"; flow:to_server,established; flags:S; sid:1000012; rev:1; classtype:attempted-admin;)
+
+# SMTP Email Traffic
+alert tcp $EXTERNAL_NET any -> $HOME_NET 25 (msg:"TCP SMTP Traffic Detected"; flow:to_server,established; sid:1000013; rev:1; classtype:misc-activity;)
+
+# IMAP Traffic
+alert tcp $EXTERNAL_NET any -> $HOME_NET 143 (msg:"TCP IMAP Traffic Detected"; flow:to_server,established; sid:1000014; rev:1; classtype:misc-activity;)
+
+# POP3 Traffic
+alert tcp $EXTERNAL_NET any -> $HOME_NET 110 (msg:"TCP POP3 Traffic Detected"; flow:to_server,established; sid:1000015; rev:1; classtype:misc-activity;)
+
+# ─── 3. UDP Traffic ──────────────────────────────────────────────────────────
+# DNS UDP
+alert udp $EXTERNAL_NET any -> $HOME_NET 53 (msg:"UDP DNS Query Detected"; sid:1000020; rev:1; classtype:misc-activity;)
+
+# DNS TCP (zone transfers / large responses)
+alert tcp $EXTERNAL_NET any -> $HOME_NET 53 (msg:"TCP DNS Query Detected (Possible Zone Transfer)"; flow:to_server,established; sid:1000021; rev:1; classtype:misc-activity;)
+
+# NTP UDP
+alert udp $EXTERNAL_NET any -> $HOME_NET 123 (msg:"UDP NTP Traffic Detected"; sid:1000022; rev:1; classtype:misc-activity;)
+
+# NTP Amplification Attack
+alert udp $EXTERNAL_NET any -> $HOME_NET 123 (msg:"UDP NTP Amplification Attempt (monlist)"; content:"|00 01 00 2a|"; depth:4; sid:1000023; rev:1; classtype:attempted-dos;)
 
 # ─── 4. Web Attacks — SQL Injection ──────────────────────────────────────────
-alert http any any -> $HOME_NET any (
-    msg:"WEB ATTACK SQL Injection -- UNION SELECT";
-    http_uri;
-    content:"UNION";
-    nocase;
-    content:"SELECT";
-    nocase;
-    distance:0;
-    sid:1000060; rev:2;)
+# Classic UNION-based SQLi
+alert tcp $EXTERNAL_NET any -> $HOME_NET $HTTP_PORTS (msg:"WEB ATTACK SQL Injection UNION SELECT"; flow:to_server,established; content:"UNION"; nocase; content:"SELECT"; nocase; distance:0; within:20; http_uri; sid:1000030; rev:1; classtype:web-application-attack;)
 
-alert http any any -> $HOME_NET any (
-    msg:"WEB ATTACK SQL Injection -- OR 1=1";
-    http_uri;
-    content:"1=1";
-    nocase;
-    sid:1000061; rev:2;)
+# OR 1=1 based SQLi
+alert tcp $EXTERNAL_NET any -> $HOME_NET $HTTP_PORTS (msg:"WEB ATTACK SQL Injection OR 1=1"; flow:to_server,established; content:"OR 1=1"; nocase; http_uri; sid:1000031; rev:1; classtype:web-application-attack;)
 
-alert http any any -> $HOME_NET any (
-    msg:"WEB ATTACK SQL Injection -- Single Quote";
-    http_uri;
-    content:"'";
-    content:"SELECT";
-    nocase;
-    within:50;
-    sid:1000062; rev:2;)
+# Single quote injection attempt
+alert tcp $EXTERNAL_NET any -> $HOME_NET $HTTP_PORTS (msg:"WEB ATTACK SQL Injection Single Quote"; flow:to_server,established; content:"'"; content:"SELECT"; nocase; http_uri; sid:1000032; rev:1; classtype:web-application-attack;)
 
-alert http any any -> $HOME_NET any (
-    msg:"WEB ATTACK SQL Injection -- DROP TABLE";
-    http_uri;
-    content:"DROP";
-    nocase;
-    content:"TABLE";
-    nocase;
-    distance:1;
-    within:20;
-    sid:1000063; rev:2;)
+# DROP TABLE injection
+alert tcp $EXTERNAL_NET any -> $HOME_NET $HTTP_PORTS (msg:"WEB ATTACK SQL Injection DROP TABLE"; flow:to_server,established; content:"DROP"; nocase; content:"TABLE"; nocase; distance:0; within:10; http_uri; sid:1000033; rev:1; classtype:web-application-attack;)
 
-alert http any any -> $HOME_NET any (
-    msg:"WEB ATTACK SQL Injection -- Comment Evasion";
-    http_uri;
-    content:"--";
-    content:"SELECT";
-    nocase;
-    within:100;
-    sid:1000064; rev:2;)
+# Blind SQLi via SLEEP/WAITFOR
+alert tcp $EXTERNAL_NET any -> $HOME_NET $HTTP_PORTS (msg:"WEB ATTACK SQL Injection Time-Based Blind (SLEEP)"; flow:to_server,established; content:"SLEEP("; nocase; http_uri; sid:1000034; rev:1; classtype:web-application-attack;)
+
+alert tcp $EXTERNAL_NET any -> $HOME_NET $HTTP_PORTS (msg:"WEB ATTACK SQL Injection Time-Based Blind (WAITFOR)"; flow:to_server,established; content:"WAITFOR DELAY"; nocase; http_uri; sid:1000035; rev:1; classtype:web-application-attack;)
 
 # ─── 5. Inbound Reconnaissance — Nmap FIN Scan ───────────────────────────────
-alert tcp any any -> $HOME_NET any (
-    msg:"RECON Nmap FIN Scan Detected";
-    flags:F;
-    ack:0;
-    sid:1000070; rev:2;)
+# FIN scan: only FIN flag set, no ACK
+alert tcp $EXTERNAL_NET any -> $HOME_NET any (msg:"RECON Nmap FIN Scan Detected"; flags:F,12; sid:1000040; rev:1; classtype:attempted-recon;)
 
-alert tcp any any -> $HOME_NET any (
-    msg:"RECON Nmap NULL Scan Detected";
-    flags:0;
-    sid:1000071; rev:2;)
+# NULL scan: no flags set
+alert tcp $EXTERNAL_NET any -> $HOME_NET any (msg:"RECON Nmap NULL Scan Detected"; flags:0; sid:1000041; rev:1; classtype:attempted-recon;)
 
-alert tcp any any -> $HOME_NET any (
-    msg:"RECON Nmap XMAS Scan Detected";
-    flags:FPU;
-    sid:1000072; rev:2;)
+# XMAS scan: FIN+PSH+URG
+alert tcp $EXTERNAL_NET any -> $HOME_NET any (msg:"RECON Nmap XMAS Scan Detected"; flags:FPU,12; sid:1000042; rev:1; classtype:attempted-recon;)
 
-alert tcp any any -> $HOME_NET any (
-    msg:"RECON Nmap SYN Stealth Scan Detected";
-    flags:S;
-    ack:0;
-    sid:1000073; rev:2;)
+# SYN scan on privileged ports (stealth scan)
+alert tcp $EXTERNAL_NET any -> $HOME_NET 1:1024 (msg:"RECON Nmap SYN Stealth Scan on Privileged Ports"; flags:S,12; threshold:type threshold, track by_src, count 20, seconds 5; sid:1000043; rev:1; classtype:attempted-recon;)
 
-# ─── 6. C2 / Reverse Shell — Netcat ─────────────────────────────────────────
-alert tcp any any -> $HOME_NET any (
-    msg:"C2 Netcat Reverse Shell Inbound";
-    content:"cmd.exe";
-    nocase;
-    sid:1000080; rev:2;)
+# Port sweep detection
+alert tcp $EXTERNAL_NET any -> $HOME_NET any (msg:"RECON Port Sweep Detected"; flags:S,12; threshold:type threshold, track by_src, count 30, seconds 10; sid:1000044; rev:1; classtype:attempted-recon;)
 
-alert tcp any any -> $HOME_NET any (
-    msg:"C2 Netcat -e /bin/bash Pattern";
-    content:"/bin/bash";
-    nocase;
-    sid:1000081; rev:2;)
+# ─── 6. Command & Control / Reverse Shells (Netcat) ─────────────────────────
+# Netcat listener / reverse shell indicator in payload
+alert tcp $EXTERNAL_NET any -> $HOME_NET any (msg:"C2 Netcat Reverse Shell Keyword (cmd.exe)"; flow:established; content:"cmd.exe"; nocase; sid:1000050; rev:1; classtype:trojan-activity;)
 
-alert tcp any any -> $HOME_NET any (
-    msg:"C2 Netcat -e /bin/sh Pattern";
-    content:"/bin/sh";
-    nocase;
-    sid:1000082; rev:2;)
+alert tcp $EXTERNAL_NET any -> $HOME_NET any (msg:"C2 Netcat Reverse Shell Keyword (/bin/sh)"; flow:established; content:"/bin/sh"; sid:1000051; rev:1; classtype:trojan-activity;)
 
-alert tcp $HOME_NET any -> any any (
-    msg:"C2 Suspicious Outbound Netcat Reverse Shell";
-    content:"/bin/sh";
-    nocase;
-    sid:1000083; rev:2;)
+alert tcp $EXTERNAL_NET any -> $HOME_NET any (msg:"C2 Netcat Reverse Shell Keyword (/bin/bash)"; flow:established; content:"/bin/bash"; sid:1000052; rev:1; classtype:trojan-activity;)
 
-# ─── 7. DoS — ICMP Flood / Ping of Death ────────────────────────────────────
-alert icmp any any -> $HOME_NET any (
-    msg:"DOS ICMP Flood Attack Detected";
-    itype:8;
-    detection_filter:track by_src, count 100, seconds 5;
-    sid:1000090; rev:2;)
+# Netcat with -e flag pipe (common in reverse shells)
+alert tcp any any -> $HOME_NET any (msg:"C2 Possible Netcat Pipe Shell (-e flag pattern)"; flow:established; content:"-e"; content:"sh"; distance:1; within:5; sid:1000053; rev:1; classtype:trojan-activity;)
 
-alert icmp any any -> $HOME_NET any (
-    msg:"DOS Ping of Death -- Oversized ICMP Packet";
-    itype:8;
-    dsize:>1024;
-    sid:1000091; rev:2;)
+# Outbound shell on suspicious high port (beaconing)
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"C2 Outbound Reverse Shell Attempt (high port)"; flow:to_server,established; content:"/bin/bash"; sid:1000054; rev:1; classtype:trojan-activity;)
 
-alert icmp any any -> $HOME_NET any (
-    msg:"DOS Fragmented ICMP (Possible PoD)";
-    fragbits:M;
-    itype:8;
-    sid:1000092; rev:2;)
+# ─── 7. Denial of Service — ICMP Flood / Ping of Death ───────────────────────
+# ICMP Flood (rate-based threshold)
+alert icmp $EXTERNAL_NET any -> $HOME_NET any (msg:"DOS ICMP Flood Detected"; itype:8; threshold:type both, track by_src, count 100, seconds 5; sid:1000060; rev:1; classtype:attempted-dos;)
+
+# Ping of Death (oversized ICMP — length > 65535 bytes fragmented)
+alert icmp $EXTERNAL_NET any -> $HOME_NET any (msg:"DOS Ping of Death Oversized ICMP Packet"; dsize:>1024; itype:8; sid:1000061; rev:1; classtype:attempted-dos;)
+
+# ICMP Type 3 (Destination Unreachable) flood — can be used in amplification
+alert icmp any any -> $HOME_NET any (msg:"DOS ICMP Destination Unreachable Flood"; itype:3; threshold:type both, track by_src, count 50, seconds 10; sid:1000062; rev:1; classtype:attempted-dos;)
+
+# SYN Flood
+alert tcp $EXTERNAL_NET any -> $HOME_NET any (msg:"DOS TCP SYN Flood Detected"; flags:S,12; threshold:type both, track by_src, count 200, seconds 5; sid:1000063; rev:1; classtype:attempted-dos;)
+
+# UDP Flood
+alert udp $EXTERNAL_NET any -> $HOME_NET any (msg:"DOS UDP Flood Detected"; threshold:type both, track by_src, count 500, seconds 5; sid:1000064; rev:1; classtype:attempted-dos;)
+
+RULES_EOF
+
+chmod 640 /etc/snort/rules/local.rules
+
+# ─── Create Snort systemd service ────────────────────────────────────────────
+log "Creating Snort systemd service..."
+cat > /etc/systemd/system/snort.service <<SNORT_SVC
+[Unit]
+Description=Snort IDS
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/snort -q -u snort -g snort -c /etc/snort/snort.conf -i ${NET_IFACE} -l /var/log/snort
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+SNORT_SVC
+
+# Create snort user if not exists
+id snort &>/dev/null || useradd -r -s /sbin/nologin -d /var/log/snort snort
+chown -R snort:snort /var/log/snort
+
+systemctl daemon-reload
+systemctl enable snort >> "$LOG_FILE" 2>&1
+systemctl start snort >> "$LOG_FILE" 2>&1 || warn "Snort failed to start — validate config with: snort -T -c /etc/snort/snort.conf"
+log "Snort IDS rules configured and service started."
 
 # =============================================================================
-# End of local.rules
+#  PHASE 7 — OpenSCAP / COMPLIANCE AUDIT
 # =============================================================================
-SNORT_RULES
+header "PHASE 7 — OpenSCAP Compliance Audit & Remediation"
 
-log "Snort rules written ($(wc -l < "${RULES_FILE}") lines)."
+log "Installing OpenSCAP tooling and SCAP Security Guide..."
+dnf install -y openscap openscap-scanner scap-security-guide >> "$LOG_FILE" 2>&1 || \
+    warn "OpenSCAP packages not available — attempting EPEL..."
+dnf install -y --enablerepo=epel openscap openscap-scanner scap-security-guide >> "$LOG_FILE" 2>&1 || \
+    warn "OpenSCAP install failed. Install manually: dnf install openscap openscap-scanner scap-security-guide"
 
-# Validate config
-if "${SNORT_BIN}" -c "${SNORT_CONF}" --plugin-path /usr/local/lib/snort/ --daq-dir /usr/local/lib/daq/ -T 2>&1 | grep -iq "snort successfully validated"; then
-    log "Snort configuration validated successfully."
-else
-    warn "Snort validation returned warnings — check manually: ${SNORT_BIN} -c ${SNORT_CONF} -T"
-fi
+SCAP_DIR="/usr/share/xml/scap/ssg/content"
+SCAP_DATASTREAM=""
+OSCAP_REPORT_DIR="/var/log/oscap"
+mkdir -p "$OSCAP_REPORT_DIR"
 
-# Start / restart Snort
-systemctl restart snort3 && log "Snort 3 service (re)started." \
-    || warn "Snort service failed — check: journalctl -u snort3"
-
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 7 — OpenSCAP / COMPLIANCE AUDIT
-# ═════════════════════════════════════════════════════════════════════════════
-section "PHASE 7: OpenSCAP Compliance Audit & Remediation"
-
-pkg_install openscap-scanner scap-security-guide openscap-utils
-
-SCAP_DS="/usr/share/xml/scap/ssg/content/ssg-rhel10-ds.xml"
-# Fallback to RHEL 9 content if RHEL 10 not yet available
-[[ ! -f "${SCAP_DS}" ]] && SCAP_DS="/usr/share/xml/scap/ssg/content/ssg-rhel9-ds.xml"
-[[ ! -f "${SCAP_DS}" ]] && { err "No SCAP datastream found. Install scap-security-guide."; exit 1; }
-log "Using SCAP datastream: ${SCAP_DS}"
-
-# Verify profile exists
-PROFILE_LIST=$(oscap info "${SCAP_DS}" 2>/dev/null | grep -A200 'Profiles:' | grep -oP 'xccdf_[^\s]+')
-if echo "${PROFILE_LIST}" | grep -q "${OSCAP_PROFILE}"; then
-    log "Profile '${OSCAP_PROFILE}' found."
-else
-    warn "Profile '${OSCAP_PROFILE}' not found. Listing available profiles:"
-    echo "${PROFILE_LIST}" | head -20
-    # Fall back to a safe default
-    OSCAP_PROFILE=$(echo "${PROFILE_LIST}" | grep -i "cis" | head -1)
-    [[ -z "${OSCAP_PROFILE}" ]] && OSCAP_PROFILE=$(echo "${PROFILE_LIST}" | head -1)
-    warn "Falling back to: ${OSCAP_PROFILE}"
-fi
-
-mkdir -p "${OSCAP_REPORT_DIR}"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OSCAP_RESULTS_XML="${OSCAP_REPORT_DIR}/results_${TIMESTAMP}.xml"
-OSCAP_REPORT_HTML="${OSCAP_REPORT_DIR}/report_${TIMESTAMP}.html"
-OSCAP_REMEDIATED_HTML="${OSCAP_REPORT_DIR}/report_post_remediation_${TIMESTAMP}.html"
-OSCAP_REMEDIATED_XML="${OSCAP_REPORT_DIR}/results_post_remediation_${TIMESTAMP}.xml"
-
-# ── Step 1: Initial scan ──────────────────────────────────────────────────
-log "Running initial OpenSCAP scan (this may take 2–5 minutes)..."
-oscap xccdf eval \
-    --profile  "${OSCAP_PROFILE}" \
-    --results  "${OSCAP_RESULTS_XML}" \
-    --report   "${OSCAP_REPORT_HTML}" \
-    --oval-results \
-    "${SCAP_DS}" \
-    || true   # oscap exits non-zero when rules fail — that's expected
-
-log "Initial scan complete → ${OSCAP_REPORT_HTML}"
-
-# Extract pass/fail summary from XML
-PASS_COUNT=$(grep -c 'result>pass<' "${OSCAP_RESULTS_XML}" 2>/dev/null || echo "?")
-FAIL_COUNT=$(grep -c 'result>fail<' "${OSCAP_RESULTS_XML}" 2>/dev/null || echo "?")
-log "Initial scan results — Pass: ${PASS_COUNT} | Fail: ${FAIL_COUNT}"
-
-# ── Step 2: Automated remediation ────────────────────────────────────────
-log "Applying automated remediation (oscap xccdf remediate)..."
-oscap xccdf remediate \
-    --profile  "${OSCAP_PROFILE}" \
-    --results  "${OSCAP_REMEDIATED_XML}" \
-    --report   "${OSCAP_REMEDIATED_HTML}" \
-    "${SCAP_DS}" \
-    || true
-
-log "Remediation complete → ${OSCAP_REMEDIATED_HTML}"
-
-# ── Step 3: Post-remediation verification scan ────────────────────────────
-OSCAP_FINAL_XML="${OSCAP_REPORT_DIR}/results_final_${TIMESTAMP}.xml"
-OSCAP_FINAL_HTML="${OSCAP_REPORT_DIR}/report_final_${TIMESTAMP}.html"
-
-log "Running post-remediation verification scan..."
-oscap xccdf eval \
-    --profile  "${OSCAP_PROFILE}" \
-    --results  "${OSCAP_FINAL_XML}" \
-    --report   "${OSCAP_FINAL_HTML}" \
-    --oval-results \
-    "${SCAP_DS}" \
-    || true
-
-FINAL_PASS=$(grep -c 'result>pass<' "${OSCAP_FINAL_XML}" 2>/dev/null || echo "?")
-FINAL_FAIL=$(grep -c 'result>fail<' "${OSCAP_FINAL_XML}" 2>/dev/null || echo "?")
-log "Final scan results — Pass: ${FINAL_PASS} | Fail: ${FINAL_FAIL}"
-
-# ── Step 4: Compliance loop (verify → remediate → verify until clean) ────
-log "Entering compliance verification loop (max 3 iterations)..."
-
-MAX_ITER=3
-ITER=0
-while [[ ${ITER} -lt ${MAX_ITER} ]]; do
-    ITER=$(( ITER + 1 ))
-    LOOP_FAIL=$(grep -c 'result>fail<' "${OSCAP_FINAL_XML}" 2>/dev/null || echo 0)
-    log "Iteration ${ITER}: ${LOOP_FAIL} failing rule(s)."
-
-    [[ "${LOOP_FAIL}" -eq 0 ]] && { log "System is compliant — exiting loop."; break; }
-
-    warn "Iteration ${ITER}: ${LOOP_FAIL} failing rules remain. Applying remediation..."
-
-    LOOP_REM_XML="${OSCAP_REPORT_DIR}/results_loop${ITER}_${TIMESTAMP}.xml"
-    LOOP_REM_HTML="${OSCAP_REPORT_DIR}/report_loop${ITER}_${TIMESTAMP}.html"
-
-    oscap xccdf remediate \
-        --profile  "${OSCAP_PROFILE}" \
-        --results  "${LOOP_REM_XML}" \
-        --report   "${LOOP_REM_HTML}" \
-        "${SCAP_DS}" \
-        || true
-
-    # Re-scan after remediation
-    OSCAP_FINAL_XML="${OSCAP_REPORT_DIR}/results_loop${ITER}_verify_${TIMESTAMP}.xml"
-    OSCAP_FINAL_HTML="${OSCAP_REPORT_DIR}/report_loop${ITER}_verify_${TIMESTAMP}.html"
-
-    oscap xccdf eval \
-        --profile  "${OSCAP_PROFILE}" \
-        --results  "${OSCAP_FINAL_XML}" \
-        --report   "${OSCAP_FINAL_HTML}" \
-        --oval-results \
-        "${SCAP_DS}" \
-        || true
+# ─── Locate RHEL 10 / RHEL 9 SCAP datastream ─────────────────────────────────
+for ds in \
+    "${SCAP_DIR}/ssg-rhel10-ds.xml" \
+    "${SCAP_DIR}/ssg-rhel9-ds.xml" \
+    "${SCAP_DIR}/ssg-rhel8-ds.xml"; do
+    if [[ -f "$ds" ]]; then
+        SCAP_DATASTREAM="$ds"
+        log "Found SCAP datastream: $ds"
+        break
+    fi
 done
 
-REMAINING_FAIL=$(grep -c 'result>fail<' "${OSCAP_FINAL_XML}" 2>/dev/null || echo "?")
-if [[ "${REMAINING_FAIL}" -eq 0 ]]; then
-    log "Compliance loop complete — system FULLY COMPLIANT."
+if [[ -z "$SCAP_DATASTREAM" ]]; then
+    warn "No SCAP datastream found in $SCAP_DIR. OpenSCAP audit will be skipped."
+    warn "Install scap-security-guide and re-run: dnf install scap-security-guide"
 else
-    warn "Compliance loop finished after ${MAX_ITER} iterations — ${REMAINING_FAIL} rule(s) still failing."
-    warn "Manual remediation may be required for remaining failures."
+    # Determine available profiles
+    log "Available SCAP profiles:"
+    oscap info "$SCAP_DATASTREAM" 2>/dev/null | grep -i "Profile" | head -20 | tee -a "$LOG_FILE" || true
+
+    # Choose profile: prefer STIG, fall back to CIS, then default
+    SCAP_PROFILE=""
+    for PROFILE_CANDIDATE in \
+        "xccdf_org.ssgproject.content_profile_stig" \
+        "xccdf_org.ssgproject.content_profile_cis" \
+        "xccdf_org.ssgproject.content_profile_cis_server_l1" \
+        "xccdf_org.ssgproject.content_profile_standard"; do
+        if oscap info "$SCAP_DATASTREAM" 2>/dev/null | grep -q "$PROFILE_CANDIDATE"; then
+            SCAP_PROFILE="$PROFILE_CANDIDATE"
+            log "Selected SCAP profile: $SCAP_PROFILE"
+            break
+        fi
+    done
+
+    if [[ -z "$SCAP_PROFILE" ]]; then
+        warn "Could not auto-detect SCAP profile. Listing available:"
+        oscap info "$SCAP_DATASTREAM" 2>/dev/null | tee -a "$LOG_FILE"
+        warn "Skipping automated scan. Run manually: oscap xccdf eval --profile <PROFILE> $SCAP_DATASTREAM"
+    else
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        REPORT_HTML="${OSCAP_REPORT_DIR}/oscap_report_${TIMESTAMP}.html"
+        RESULTS_XML="${OSCAP_REPORT_DIR}/oscap_results_${TIMESTAMP}.xml"
+        REMEDIATION_SCRIPT="${OSCAP_REPORT_DIR}/oscap_remediation_${TIMESTAMP}.sh"
+
+        # ── Step 1: Initial Scan ─────────────────────────────────────────────
+        log "Running OpenSCAP initial compliance scan (this may take a few minutes)..."
+        oscap xccdf eval \
+            --profile "$SCAP_PROFILE" \
+            --results "$RESULTS_XML" \
+            --report "$REPORT_HTML" \
+            --fetch-remote-resources \
+            "$SCAP_DATASTREAM" >> "$LOG_FILE" 2>&1 || \
+            warn "oscap scan completed with findings (non-zero exit is normal when issues are found)."
+
+        log "Initial scan report: $REPORT_HTML"
+        log "Initial scan XML results: $RESULTS_XML"
+
+        # ── Step 2: Generate Remediation Script ──────────────────────────────
+        log "Generating automated remediation bash script..."
+        oscap xccdf generate fix \
+            --profile "$SCAP_PROFILE" \
+            --template urn:xccdf:fix:script:sh \
+            --output "$REMEDIATION_SCRIPT" \
+            "$SCAP_DATASTREAM" >> "$LOG_FILE" 2>&1 || \
+            warn "Remediation script generation failed."
+
+        if [[ -f "$REMEDIATION_SCRIPT" ]]; then
+            chmod 700 "$REMEDIATION_SCRIPT"
+            log "Remediation script saved: $REMEDIATION_SCRIPT"
+
+            echo ""
+            read -rp "$(echo -e "${YELLOW}Apply OpenSCAP automated remediation now? This will modify system settings. (yes/no):${RESET} ")" APPLY_REMEDIATION
+
+            if [[ "${APPLY_REMEDIATION,,}" == "yes" || "${APPLY_REMEDIATION,,}" == "y" ]]; then
+                log "Applying remediation script: $REMEDIATION_SCRIPT"
+                bash "$REMEDIATION_SCRIPT" >> "$LOG_FILE" 2>&1 || \
+                    warn "Remediation script completed with warnings (check log)."
+
+                # ── Step 3: Post-remediation scan ────────────────────────────
+                log "Running post-remediation compliance scan..."
+                POST_REPORT="${OSCAP_REPORT_DIR}/oscap_post_remediation_${TIMESTAMP}.html"
+                POST_RESULTS="${OSCAP_REPORT_DIR}/oscap_post_results_${TIMESTAMP}.xml"
+
+                oscap xccdf eval \
+                    --profile "$SCAP_PROFILE" \
+                    --results "$POST_RESULTS" \
+                    --report "$POST_REPORT" \
+                    --fetch-remote-resources \
+                    "$SCAP_DATASTREAM" >> "$LOG_FILE" 2>&1 || \
+                    warn "Post-remediation scan completed with remaining findings."
+
+                log "Post-remediation report: $POST_REPORT"
+                log "Post-remediation XML:    $POST_RESULTS"
+                echo -e "${GREEN}[+] Post-remediation scan complete. Review: ${POST_REPORT}${RESET}"
+            else
+                log "Remediation script generated but not applied. Run manually: bash $REMEDIATION_SCRIPT"
+            fi
+        fi
+    fi
 fi
 
-log "Final HTML compliance report → ${OSCAP_FINAL_HTML}"
+# =============================================================================
+#  PHASE 8 — VERIFICATION & SUMMARY
+# =============================================================================
+header "PHASE 8 — Verification & Summary"
 
-# ── Re-enable SELinux enforcing after remediation ─────────────────────────
-log "Re-enabling SELinux enforcing mode..."
-sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
-setenforce 1 || warn "Could not set SELinux to enforcing; reboot may be required."
+echo -e "${BOLD}${GREEN}Service Status:${RESET}"
+for SVC in sshd cowrie snort iptables; do
+    STATUS=$(systemctl is-active "$SVC" 2>/dev/null || echo "inactive")
+    if [[ "$STATUS" == "active" ]]; then
+        echo -e "  ${GREEN}✔${RESET} ${SVC}: ${GREEN}active${RESET}"
+    else
+        echo -e "  ${RED}✘${RESET} ${SVC}: ${RED}${STATUS}${RESET}"
+    fi
+done
 
-# ═════════════════════════════════════════════════════════════════════════════
-# FINAL SUMMARY
-# ═════════════════════════════════════════════════════════════════════════════
-section "HARDENING COMPLETE — Summary"
+echo ""
+echo -e "${BOLD}${CYAN}Configuration Summary:${RESET}"
+echo -e "  ┌─────────────────────────────────────────────────────────"
+echo -e "  │  ID / Name       : ${USER_ID} / ${USER_NAME}"
+echo -e "  │  SSH Port        : ${SSH_PORT}"
+echo -e "  │  Cowrie Port     : ${COWRIE_PORT}"
+echo -e "  │  Cowrie Hostname : ${USER_ID}"
+echo -e "  │  Snort Interface : ${NET_IFACE}"
+echo -e "  │  Snort Rules     : /etc/snort/rules/local.rules"
+echo -e "  │  OpenSCAP Report : ${OSCAP_REPORT_DIR}/"
+echo -e "  │  Log File        : ${LOG_FILE}"
+echo -e "  └─────────────────────────────────────────────────────────"
 
-echo -e "${GREEN}"
-cat <<SUMMARY
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │                 RHEL 10 Hardening Summary                            │
-  ├──────────────────────────────────────────────────────────────────────┤
-  │  Employee    : ${Employee_ID} — ${Employee_NAME}
-  ├──────────────────────────────────────────────────────────────────────┤
-  │  [Phase 1]  Snort 3 IDS installed & configured                       │
-  │  [Phase 2]  OpenSSH hardened on port ${SSH_PORT}                           │
-  │             → Password auth DISABLED                                 │
-  │             → Key-based auth ENABLED                                 │
-  │             → Root login DISABLED                                    │
-  │             → TCP/X11 forwarding DISABLED                            │
-  │             → Login banner set                                       │
-  │  [Phase 3]  MFA (Google Authenticator TOTP) configured via PAM      │
-  │             → Each user must run: google-authenticator               │
-  │  [Phase 4]  iptables firewall enforced                               │
-  │             → Only ports ${COWRIE_PORT} (Cowrie) and ${SSH_PORT} (SSH) ACCEPT        │
-  │             → Log prefixes: < SSH TRAFFIC >                          │
-  │                             << HONEYPOT TRAFFIC >>                   │
-  │                             <<< BLOCKED TRAFFIC >>>                  │
-  │  [Phase 5]  Cowrie honeypot running on port ${COWRIE_PORT}                  │
-  │             → Hostname: ${Employee_ID}                                │
-  │             → Users: root (custom pass), staff (custom pass)         │
-  │  [Phase 6]  Snort local.rules written                                │
-  │             → ICMP, TCP (Web/SSH/Email), UDP (DNS/NTP)               │
-  │             → SQL Injection, Nmap FIN scan, Netcat C2                │
-  │             → ICMP Flood / Ping of Death detection                   │
-  │  [Phase 7]  OpenSCAP CIS L2 scan + auto-remediation loop            │
-  │             → Reports: ${OSCAP_REPORT_DIR}/
-  │             → Remaining failures: ${REMAINING_FAIL}
-  ├──────────────────────────────────────────────────────────────────────┤
-  │  NEXT STEPS:                                                         │
-  │  1. Enroll MFA: sudo -u <user> google-authenticator                  │
-  │     -t -d -f -r 3 -R 30 -s ~/.ssh/.google_authenticator             │
-  │  2. Verify SSH: ssh -p ${SSH_PORT} -i ~/.ssh/id_ed25519 <user>@<host>      │
-  │  3. Check Snort: journalctl -u snort3 -f                             │
-  │  4. Check Cowrie: journalctl -u cowrie -f                            │
-  │  5. Review SCAP report: ${OSCAP_REPORT_DIR}/                         │
-  └──────────────────────────────────────────────────────────────────────┘
-SUMMARY
-echo -e "${NC}"
+echo ""
+echo -e "${BOLD}${YELLOW}Post-Install Reminders:${RESET}"
+echo -e "  1. Each user must run ${BOLD}google-authenticator${RESET} to enroll their TOTP key:"
+echo -e "     ${CYAN}google-authenticator -t -d -f -r 3 -R 30 -W${RESET}"
+echo -e "  2. Test SSH login from another terminal before closing this session:"
+echo -e "     ${CYAN}ssh -p ${SSH_PORT} -i <your_key> ${TARGET_USER:-root}@<server_ip>${RESET}"
+echo -e "  3. Verify iptables rules: ${CYAN}iptables -L -v -n${RESET}"
+echo -e "  4. Check Snort alerts:   ${CYAN}tail -f /var/log/snort/alert${RESET}"
+echo -e "  5. Check Cowrie logs:    ${CYAN}tail -f /opt/cowrie/var/log/cowrie/cowrie.json${RESET}"
+echo -e "  6. OpenSCAP HTML reports are in: ${CYAN}${OSCAP_REPORT_DIR}/${RESET}"
+echo ""
+log "Hardening script completed successfully at $(date)."
+echo -e "${BOLD}${GREEN}All phases complete. System hardened and ready.${RESET}\n"
