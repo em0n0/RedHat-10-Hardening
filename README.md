@@ -1,6 +1,6 @@
 # RHEL 9 Security Hardening -- Automated Setup Script
 
-An automated, defensive shell script designed to streamline security baseline provisioning on **Red Hat Enterprise Linux (RHEL) 10**. 
+An automated, defensive shell script designed to streamline security baseline provisioning on **Red Hat Enterprise Linux (RHEL) 9**. 
 
 This script consolidates infrastructure hardening, Multi-Factor Authentication (MFA), defensive deception (honeypot deployment), stateful firewall logic, and a lightweight Network Intrusion Detection System (NIDS) installation into a unified execution flow.
 
@@ -55,7 +55,7 @@ The script utilizes a design pattern where all configuration parameters are coll
 ### 1. Download and Prepare the Script
 Move the script onto your RHEL 9 target, name it `rhel10_security_setup.sh`, and mark it as executable:
 ```bash
-chmod +x rhel10_security_setup.sh
+chmod +x rhel9_security_setup.sh
 
 ```
 
@@ -64,7 +64,7 @@ chmod +x rhel10_security_setup.sh
 Execute the script as root:
 
 ```bash
-sudo ./rhel10_security_setup.sh
+sudo ./rhel9_security_setup.sh
 
 ```
 
@@ -91,7 +91,7 @@ From your **local machine (client)**, generate an modern keypair if you haven't 
 ```bash
 # On your local workstation:
 ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_rhel10
-ssh-copy-id -i ~/.ssh/id_ed25519_rhel10.pub -p <YOUR_CUSTOM_SSH_PORT> <user>@<server_ip>
+ssh-copy-id -i ~/.ssh/.pub -p <YOUR_CUSTOM_SSH_PORT> <user>@<server_ip>
 
 ```
 
@@ -120,7 +120,7 @@ google-authenticator
 **Do not close your active root session.** Open a brand new terminal instance on your local computer and test your login path:
 
 ```bash
-ssh -i ~/.ssh/id_ed25519_rhel10 -p <YOUR_CUSTOM_SSH_PORT> <user>@<server_ip>
+ssh -i ~/.ssh/id_ed25519_rhel9 -p <YOUR_CUSTOM_SSH_PORT> <user>@<server_ip>
 
 ```
 
@@ -171,7 +171,7 @@ tail -f /var/log/snort/alert_fast.txt
 
 ***# RHEL 9  Hardening -- Automated Setup Script
 
-An automated, defensive shell script designed to streamline  baseline provisioning on **Red Hat Enterprise Linux (RHEL) 10**. 
+An automated, defensive shell script designed to streamline  baseline provisioning on **Red Hat Enterprise Linux (RHEL) 9**. 
 
 This script consolidates infrastructure hardening, Multi-Factor Authentication (MFA), defensive deception (honeypot deployment), stateful firewall logic, and a lightweight Network Intrusion Detection System (NIDS) installation into a unified execution flow.
 
@@ -226,7 +226,7 @@ The script utilizes a design pattern where all configuration parameters are coll
 ### 1. Download and Prepare the Script
 Move the script onto your RHEL 9 target, name it `rhel10_security_setup.sh`, and mark it as executable:
 ```bash
-chmod +x rhel10_security_setup.sh
+chmod +x rhel9_security_setup.sh
 
 ```
 
@@ -235,7 +235,7 @@ chmod +x rhel10_security_setup.sh
 Execute the script as root:
 
 ```bash
-sudo ./rhel10_security_setup.sh
+sudo ./rhel9_security_setup.sh
 
 ```
 
@@ -261,8 +261,8 @@ From your **local machine (client)**, generate an modern keypair if you haven't 
 
 ```bash
 # On your local workstation:
-ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_rhel10
-ssh-copy-id -i ~/.ssh/id_ed25519_rhel10.pub -p <YOUR_CUSTOM_SSH_PORT> <user>@<server_ip>
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_rhel9
+ssh-copy-id -i ~/.ssh/id_ed25519_rhel9.pub -p <YOUR_CUSTOM_SSH_PORT> <user>@<server_ip>
 
 ```
 
@@ -291,7 +291,7 @@ google-authenticator
 **Do not close your active root session.** Open a brand new terminal instance on your local computer and test your login path:
 
 ```bash
-ssh -i ~/.ssh/id_ed25519_rhel10 -p <YOUR_CUSTOM_SSH_PORT> <user>@<server_ip>
+ssh -i ~/.ssh/id_ed25519_rhel9 -p <YOUR_CUSTOM_SSH_PORT> <user>@<server_ip>
 
 ```
 
