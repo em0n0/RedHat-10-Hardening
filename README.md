@@ -335,3 +335,8 @@ Watch for Snort IDS signatures catching suspicious network operations (like ping
 
 ```bash
 tail -f /var/log/snort/alert_fast.txt
+
+
+License
+
+MIT — see LICENSE for details.
